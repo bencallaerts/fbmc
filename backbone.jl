@@ -1,171 +1,448 @@
-## Backbone to structure your code
-# author: Kenneth Bruninx, Sebastian Gonzato
-# last update: October 26, 2020
-# description: backbone to structure your code. You're not obliged to use this
-# in your assignment, but you may.
+## Flow Based Market Coupling
+# author: Ben Callaerts
+# last update: March 3, 2022
 
-## Step 0: Activate environment - ensure consistency accross computers
+## Step 0: Activate environment
+cd("C:/Users/User/Documents/Thesis/Modeling")
+
 using Pkg
-Pkg.activate(@__DIR__) # @__DIR__ = directory this script is in
-Pkg.instantiate() # If a Manifest.toml file exist in the current project, download all the packages declared in that manifest. Else, resolve a set of feasible packages from the Project.toml files and install them.
-
-##  Step 1: input data
+Pkg.activate(@__DIR__)
+Pkg.instantiate()
 using CSV
 using DataFrames
 using YAML
+using PrettyTables
 
-data = YAML.load_file(joinpath(@__DIR__, "data_gep.yaml"))
-ts = CSV.read(joinpath(@__DIR__, "Profiles_12_reprdays.csv"), DataFrame)
-repr_days = CSV.read(joinpath(@__DIR__, "Weights_12_reprdays.csv"), DataFrame)
+##  Step 1: Input data
+data = "data-basic"
 
-## Step 2: create model & pass data to model
+bus = CSV.read(joinpath(data, "bus.csv"), DataFrame; delim=";")
+branch = CSV.read(joinpath(data, "branch.csv"), DataFrame; delim=";")
+plant = CSV.read(joinpath(data, "plant.csv"), DataFrame; delim=";")
+load = CSV.read(joinpath(data, "load.csv"), DataFrame; delim=";")
+incidence = CSV.read(joinpath(data, "incidence.csv"), DataFrame; delim=";")
+susceptance = CSV.read(joinpath(data, "susceptance.csv"), DataFrame; delim=";")
+@info "Data read"
+
+## Step 2: Create model
 using JuMP
 using Gurobi
 m = Model(optimizer_with_attributes(Gurobi.Optimizer))
+@info "Model created"
 
-# Step 2a: create sets
-function define_sets!(m::Model, data::Dict)
-    # create dictionary to store sets
+# Define sets
+function define_sets!(m::Model)
     m.ext[:sets] = Dict()
 
-    # define the sets
-    m.ext[:sets][:JH] = 1:data["nTimesteps"] # Timesteps
-    m.ext[:sets][:JD] = 1:data["nReprDays"] # Representative days
-    m.ext[:sets][:ID] = [id for id in keys(data["dispatchableGenerators"])] # dispatchable generators
-    m.ext[:sets][:IV] = [iv for iv in keys(data["variableGenerators"])] # variable generators
-    m.ext[:sets][:I] = union(m.ext[:sets][:ID], m.ext[:sets][:IV]) # all generators
+    N = m.ext[:sets][:N] = bus[:,:BusID]
+    L = m.ext[:sets][:L] = branch[:,:BranchID]
+    P = m.ext[:sets][:P] = plant[:,:GenID]
+    Z = m.ext[:sets][:Z] = sort(unique(bus[:,:Zone]))
 
-    # return model
-    return m
+    return N, L, P, Z
 end
 
-# Step 2b: add time series
-function process_time_series_data!(m::Model, data::Dict, ts::DataFrame)
-    # extract the relevant sets
-    JH = m.ext[:sets][:JH] # Time steps
-    JD = m.ext[:sets][:JD] # Days
-
-    # create dictionary to store time series
-    m.ext[:timeseries] = Dict()
-
-    # example: add time series to dictionary
-    m.ext[:timeseries][:D] = [ts.Load[jh+data["nTimesteps"]*(jd-1)] for jh in JH, jd in JD]
-
-    # return model
-    return m
+# Build GSK
+function get_gsk_flat()
+	gsk_temp = zeros(Float64, length(N), length(Z))
+	for n in N
+		zone_temp = bus.Zone[bus[:,:BusID].==n][1]
+		gsk_value_temp = 1/size(bus[bus[:,:Zone].==zone_temp,:],1)
+		gsk_temp[findfirst(N .== n), findfirst(Z .== zone_temp)] = gsk_value_temp
+	end
+	return gsk_temp
 end
 
-# step 2c: process input parameters
-function process_parameters!(m::Model, data::Dict, repr_days::DataFrame)
-    # extract the sets you need
-    I = m.ext[:sets][:I]
+# Build PTDF
+function build_ptdf(m::Model)
+	N = m.ext[:sets][:N]
+	L = m.ext[:sets][:L]
+	Z = m.ext[:sets][:Z]
+	gsk = m.ext[:parameters][:gsk]
 
-    # generate a dictonary "parameters"
-    m.ext[:parameters] = Dict()
+	MWBase = 380^2
+	slack_node = 4
+	slack_position = findfirst(N .== slack_node)
 
-    # example: legacy capacity
-    d = merge(data["dispatchableGenerators"],data["variableGenerators"])
-    LC = m.ext[:parameters][:LC] = Dict(i => d[i]["legcap"] for i in I) # MW
-    VC = m.ext[:parameters][:VC] = Dict(id => d[id]["fuelCosts"] for id in ID) # MW
+	# Build nodal PTDFs
+	line_sus_mat = Matrix(susceptance)/MWBase*Matrix(incidence)
+	node_sus_mat = transpose(Matrix(incidence))*Matrix(susceptance)/MWBase*Matrix(incidence)
 
-    # return model
+	line_sus_mat_ = line_sus_mat[:, 1:end .!= slack_position]
+	node_sus_mat_ = node_sus_mat[1:end .!= slack_position, 1:end .!= slack_position]
+
+	ptdfN = line_sus_mat_*inv(node_sus_mat_)
+	zero_column = zeros(Float64, length(L), 1)
+	ptdfN = hcat(ptdfN[:,1:(slack_position-1)], zero_column, ptdfN[:,slack_position:end])
+	# PTDF = transpose(PTDF)
+	ptdfZ = ptdfN*gsk
+	return ptdfN, ptdfZ
+end
+
+# Process input parameters
+function process_parameters!(m::Model)
+	m.ext[:parameters] = Dict()
+
+	N = m.ext[:sets][:N]
+    P = m.ext[:sets][:P]
+    Z = m.ext[:sets][:Z]
+
+	m.ext[:parameters][:gsk] = get_gsk_flat()
+	m.ext[:parameters][:ptdfN], m.ext[:parameters][:ptdfZ] = build_ptdf(m)
+
+	# # starten van nodale ptdf
+	# # gsk als input
+	# # zonale ptdfs berekenen
+	# m.ext[:parameters][:ptdf_Z] = [0.5 0.25 0; 0.5 0.25 0; -0.5 -0.75 0; -0.5 0.25 0]
+	# m.ext[:parameters][:ptdf_N] = [0.5 -0.25 0.25 0; 0.5 0.75 0.25 0; -0.5 -0.25 -0.75 0; -0.5 -0.25 0.25 0]
+
+	#m.ext[:parameters][:f] = [333.33 133.33 -266.66 -200]
+	#m.ext[:parameters][:f] = [350 150 -250 -250]
+	m.ext[:parameters][:f] = [350 150 -250 -150]
+	#m.ext[:parameters][:f] = [0 0 0 0]
+	#m.ext[:parameters][:np] = [333.33 66.66 -400]
+	#m.ext[:parameters][:np] = [350 0 -400]
+	m.ext[:parameters][:np] = [300 100 -400]
+	#m.ext[:parameters][:np] = [0 0 0]
+	m.ext[:parameters][:p_in_n] = Dict(map(n -> n => [p for p in P if plant[plant[:,:GenID].==p, :OnBus][1] == n], N))
+	m.ext[:parameters][:p_in_z] = Dict(map(z -> z => [p for p in P if plant[plant[:,:GenID].==p, :Zone][1] == z], Z))
+	m.ext[:parameters][:n_in_z] = Dict(map(z -> z => [n for n in N if bus[bus[:,:BusID].==n, :Zone][1] == z], Z))
+
     return m
 end
 
 # call functions
-define_sets!(m, data)
-process_time_series_data!(m, data, ts)
-process_parameters!(m, data, repr_days)
+define_sets!(m)
+@info "Sets created"
+process_parameters!(m)
+@info "Parameters created"
 
-## Step 3: construct your model
-# Greenfield GEP - single year (Lecture 3 - slide 25, but based on representative days instead of full year)
-function build_GEP_model!(m::Model)
-    # Clear m.ext entries "variables", "expressions" and "constraints"
-    m.ext[:variables] = Dict()
-    m.ext[:expressions] = Dict()
-    m.ext[:constraints] = Dict()
-
-    # Extract sets
-    JH = m.ext[:sets][:JH]
-    JD = m.ext[:sets][:JD]
-    ID = m.ext[:sets][:ID]
-    I = m.ext[:sets][:I]
-    IV = m.ext[:sets][:IV]
-
-    # Extract time series data
-    D = m.ext[:timeseries][:D] # demand
-
-    # Extract parameters
-    LC = m.ext[:parameters][:LC]
-    VC = m.ext[:parameters][:VC]
-
-    # Create variables
-    cap = m.ext[:variables][:cap] = @variable(m, [i=I], lower_bound=0, base_name="capacity")
-    g = m.ext[:variables][:g] = @variable(m, [i=I,jh=JH,jd=JD], lower_bound=0, base_name="generation")
-
-    # Create affine expressions (= linear combinations of variables)
-    # dummy example
-    dummy = m.ext[:expressions][:dummy] = @expression(m, [i=IV,jh=JH,jd=JD],
-        cap[i] - g[i,jh,jd]
-    )
-
-    # Formulate objective 1a
-    m.ext[:objective] = @objective(m, Min,
-        sum(VC[i]*g[i,jh,jd] for i in ID, jh in JH, jd in JD)
-    )
-
-    # constraints
-    # 3a1 - conventional
-    m.ext[:constraints][:con3a1conv] = @constraint(m, [i=ID,jh=JH,jd=JD],
-        g[i,jh,jd] <= (cap[i]+LC[i])
-    )
-
-    return m
+## Step 2b: Additional Functions
+# Get marginal cost of plant p
+function get_mc(p)
+	return plant[plant[:,:GenID].==p, :Costs][1]
 end
 
-# recall that you can, once you've built a model, delete and overwrite constraints using the appropriate reference:
-# example:   delete(m,m.ext[:constraints][:con3a1conv][id,jh,jd]) (needs to be done in for-loop over id, jh, jd)
+# Get maximum capacity
+function get_gen_up(p)
+	return plant.Pmax[plant[:,:GenID].==p][1]
+end
 
-# Build your model
-build_GEP_model!(m)
+function get_dem(n)
+	return load[1,n]
+end
 
-## Step 4: solve
-# current model is incomplete, so all variables and objective will be zero
+function get_line_cap(l)
+	return branch.Pmax[branch[:,:BranchID].==l][1]
+end
+
+function find_maximum_mc()
+	max_temp = 0
+    for p in plant[:,:GenID]
+        mc_temp = get_mc(p)
+        if mc_temp > max_temp
+            max_temp = mc_temp
+        end
+    end
+	return max_temp
+end
+
+## Step 3: Construct your models
+
+function model1!(m::Model)
+	# Clear m.ext entries
+	m.ext[:variables] = Dict()
+	m.ext[:expressions] = Dict()
+	m.ext[:constraints] = Dict()
+
+	# Sets
+	Z = m.ext[:sets][:Z]
+	N = m.ext[:sets][:N]
+	L = m.ext[:sets][:L]
+	P = m.ext[:sets][:P]
+
+	# Parameters
+	ptdf_Z = m.ext[:parameters][:ptdf_Z]
+	ptdf_N = m.ext[:parameters][:ptdf_N]
+	np = m.ext[:parameters][:np]
+	f = m.ext[:parameters][:f]
+	p_in_n = m.ext[:parameters][:p_in_n]
+	p_in_z = m.ext[:parameters][:p_in_z]
+
+	# Variables
+	GEN = m.ext[:variables][:GEN] = @variable(m, [p=P], lower_bound=0, upper_bound=get_gen_up(p), base_name="generation")
+	NP = m.ext[:variables][:NP] = @variable(m, [z=Z], base_name="net position")
+
+	# Expressions
+	CG = m.ext[:expressions][:CG] = @expression(m,[z=Z],
+        sum(GEN[p]*get_mc(p) for p in p_in_z[z])
+    	)
+	Fp = m.ext[:expressions][:Fp] = @expression(m, [l=L],
+		sum(ptdf_N[l,n]*(GEN[n]-get_dem(n)) for n=N)
+		)
+	Fref = m.ext[:expressions][:Fref] = @expression(m, [l=L],
+		f[l] - sum(ptdf_Z[l,z]*np[z] for z in Z)
+		)
+	RAMpos = m.ext[:expressions][:RAMpos] = @expression(m, [l=L],
+		get_line_cap(l)-Fref[l]
+		)
+	RAMneg = m.ext[:expressions][:RAMneg] = @expression(m, [l=L],
+		get_line_cap(l)+Fref[l]
+		)
+	Fc = m.ext[:expressions][:Fc] = @expression(m, [l=L],
+		Fref[l]+sum(ptdf_Z[l,z]*NP[z] for z in Z)
+		)
+
+	# Objective
+	m.ext[:objective] = @objective(m, Min,
+		sum(CG[z] for z in Z)
+		)
+
+	# Constraints
+	m.ext[:constraints][:con9f] = @constraint(m, [n=N],
+		get_dem(n)
+		==
+		sum(GEN[p] for p in p_in_n[n])
+		)
+
+	@info "Model 1 executed"
+	return m
+end
+
+function model2!(m::Model)
+	# Model
+	model1!(m)
+
+	# Sets
+	Z = m.ext[:sets][:Z]
+	N = m.ext[:sets][:N]
+
+	# Parameters
+	n_in_z = m.ext[:parameters][:n_in_z]
+	p_in_z = m.ext[:parameters][:p_in_z]
+
+	# Variables
+	GEN = m.ext[:variables][:GEN]
+
+	# Constraints
+	for n in N
+		delete(m,m.ext[:constraints][:con9f][n])
+	end
+
+	m.ext[:constraints][:con9f] = @constraint(m, [z=Z],
+		sum(get_dem(n) for n in n_in_z[z])
+		==
+		sum(GEN[p] for p in p_in_z[z])
+		)
+
+	@info "Model 2 executed"
+	return m
+end
+
+function model3!(m::Model)
+	# Model
+	model2!(m)
+
+	# Sets
+	Z = m.ext[:sets][:Z]
+
+	# Mapping
+	n_in_z = m.ext[:parameters][:n_in_z]
+	p_in_z = m.ext[:parameters][:p_in_z]
+
+	# Variables
+	GEN = m.ext[:variables][:GEN]
+	NP = m.ext[:variables][:NP]
+
+	# Constraints
+	for z in Z
+		delete(m,m.ext[:constraints][:con9f][z])
+	end
+
+	m.ext[:constraints][:con9f] = @constraint(m, [z=Z],
+		sum(get_dem(n) for n in n_in_z[z])
+		==
+		sum(GEN[p] for p in p_in_z[z])
+		- NP[z]
+		)
+
+	m.ext[:constraints][:con9i] = @constraint(m,
+		sum(NP[z] for z in Z) == 0
+		)
+
+	@info "Model 3 executed"
+	return m
+end
+
+function model4!(m::Model)
+	# Model
+	model3!(m)
+
+	# Sets
+	Z = m.ext[:sets][:Z]
+	L = m.ext[:sets][:L]
+
+	# Parameters
+	ptdf_Z = m.ext[:parameters][:ptdf_Z]
+	np = m.ext[:parameters][:np]
+	f = m.ext[:parameters][:f]
+
+	# Variables
+	NP = m.ext[:variables][:NP]
+
+	# Constraints
+	m.ext[:constraints][:con9j] = @constraint(m,[l=L],
+		get_line_cap(l) - f[l]
+		>=
+		sum(ptdf_Z[l,z]*(NP[z] - np[z]) for z in Z)
+	 	)
+
+	m.ext[:constraints][:con9k] = @constraint(m, [l=L],
+		-get_line_cap(l) - f[l]
+		<=
+		sum(ptdf_Z[l,z]*(NP[z]-np[z]) for z in Z)
+		)
+
+	@info "Model 4 executed"
+	return m
+end
+
+function model5!(n::Model)
+	# Model
+	n.ext[:variables] = Dict()
+	n.ext[:expressions] = Dict()
+	n.ext[:constraints] = Dict()
+
+	# Sets
+	N = n.ext[:sets][:N]
+    L = n.ext[:sets][:L]
+    P = n.ext[:sets][:P]
+    Z = n.ext[:sets][:Z]
+
+	# Parameters
+	g = n.ext[:parameters][:g]
+	n_in_z = n.ext[:parameters][:n_in_z]
+	p_in_z = n.ext[:parameters][:p_in_z]
+	p_in_n = n.ext[:parameters][:p_in_n]
+	a=0.25
+	ptdf_N = n.ext[:parameters][:ptdf_N]
+
+	# Variables
+	UP = n.ext[:variables][:UP] = @variable(n, [p=P], lower_bound=0, base_name="upward redispatch")
+	DOWN = n.ext[:variables][:DOWN] = @variable(n, [p=P], lower_bound=0, base_name="downward redispatch")
+
+	# Expressions
+	CC = n.ext[:expressions][:CC] = @expression(n,[z=Z],
+		sum((1+a)*UP[p]*get_mc(p)
+		- (1-a)*DOWN[p]*get_mc(p) for p in p_in_z[z])
+		)
+
+	# Objective
+	n.ext[:objective] = @objective(n, Min,
+		sum(CC[z] for z in Z)
+		)
+
+	# Constraints
+	n.ext[:constraints][:con15b] = @constraint(n,
+		sum(UP[p] for p in P) == sum(DOWN[p] for p in P)
+		)
+	n.ext[:constraints][:con15c] = @constraint(n, [l=L],
+		-get_line_cap(l)
+		<=
+		sum(ptdf_N[l,n]*
+		(sum(g[p]+UP[p]-DOWN[p] for p in p_in_n[n]) - get_dem(n))
+		for n in N)
+		<=
+		get_line_cap(l)
+		)
+	n.ext[:constraints][:con15d] = @constraint(n, [p=P],
+		UP[p] <= get_gen_up(p) - g[p]
+		)
+	n.ext[:constraints][:con15e] = @constraint(n, [p=P],
+		DOWN[p] <= g[p]
+		)
+
+	@info "Model 5 executed"
+	return n
+end
+
+# function modelx!(m::Model)
+	## Model
+	# modelxmin1!()
+	## Sets
+	## Parameters
+	## Variables
+	## Expressions
+	## Objective
+	## Constraints
+	#@info "Model x executed"
+	#return m
+# end
+
+#model1!(m)
+#model2!(m)
+#model3!(m)
+#model4!(m)
+
+model4!(m)
 optimize!(m)
+g = value.(m.ext[:variables][:GEN])
+# if redispatch nodig, doe dan redispatch
+# anders niet
+n = Model(optimizer_with_attributes(Gurobi.Optimizer))
+define_sets!(n)
+process_parameters!(n)
+n.ext[:parameters][:g] = g
 
-# check termination status
-print(
-    """
+model5!(n)
 
-    Termination status: $(termination_status(m))
+## Step 4: Solve
+optimize!(n)
+@info "Model optimised"
 
-    """
+println("Termination status: ", termination_status(n) )
+println("Objective: ", value.(n.ext[:objective]))
+println("")
+print(n)
+println("")
+
+nodes = DataFrame(
+	node = [n for n in m.ext[:sets][:N]],
+	D = [get_dem(n) for n in m.ext[:sets][:N]],
+	GMAX = [get_gen_up(p) for p in m.ext[:sets][:P]],
+	MC = [get_mc(p) for p in m.ext[:sets][:P]],
+	GEN = [value.(m.ext[:variables][:GEN][p]) for p in m.ext[:sets][:P]]
 )
 
+CSV.write("C:/Users/User/Documents/Thesis/Modeling/results/nodes.csv", nodes,  delim=';', decimal=',')
 
-# print some output
-@show value(m.ext[:objective])
-@show value.(m.ext[:variables][:cap])
+pretty_table(nodes, header=["node", "Dem[MW]", "Gmax[MW]","MC[€/MWh]","GEN[MW]"])
 
-## Step 5: interpretation
+lines = DataFrame(
+	line=["1-2","2-4","4-3","3-1"],
+	cap=[get_line_cap(l) for l in m.ext[:sets][:L]],
+	Fref=[value.(m.ext[:expressions][:Fref][l]) for l in m.ext[:sets][:L]],
+	Fc=[value.(m.ext[:expressions][:Fc][l]) for l in m.ext[:sets][:L]],
+	Fp=[value.(m.ext[:expressions][:Fp][l]) for l in m.ext[:sets][:L]],
+	RAMpos=[value.(m.ext[:expressions][:RAMpos][l]) for l in m.ext[:sets][:L]],
+	RAMneg=[value.(m.ext[:expressions][:RAMneg][l]) for l in m.ext[:sets][:L]]
+)
+
+CSV.write("C:/Users/User/Documents/Thesis/Modeling/results/lines.csv", lines,  delim=';', decimal=',')
+
+pretty_table(lines, header=["line","cap[MW]","Fref[MW]","Fc[MW]","Fp[MW]","RAM+[MW]","RAM-[MW]"])
+
+zones = DataFrame(
+	zone=["A","B","C"],
+	NP=[value.(m.ext[:variables][:NP][z]) for z in m.ext[:sets][:Z]],
+	CG=[value.(m.ext[:expressions][:CG][z]) for z in m.ext[:sets][:Z]],
+	#CC=[value.(m.ext[:expressions][:CC][z]) for z in m.ext[:sets][:Z]]
+)
+
+CSV.write("C:/Users/User/Documents/Thesis/Modeling/results/zones.csv", zones,  delim=';', decimal=',')
+
+#pretty_table(zones, header=["zone", "NP[MW]", "CG[EUR]", "CC[EUR]"])
+
+
+## Step 5: Interpretation
 using Plots
-using StatsPlots
-
-# examples on how to access data
-
-# sets
-JH = m.ext[:sets][:JH]
-JD = m.ext[:sets][:JD]
-I = m.ext[:sets][:I]
-
-# parameters
-D = m.ext[:timeseries][:D]
-LC = m.ext[:parameters][:LC]
-
-# variables/expressions
-g = value.(m.ext[:variables][:g])
-# λ = dual.(m.ext[:constraints][:con2a]) # con2a is not defined, will not work
-
-# create arrays for plotting
-# λvec = [λ[jh,jd] for jh in JH, jd in JD]
-capvec = [cap[i] for  i in I]
