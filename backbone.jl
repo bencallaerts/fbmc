@@ -2,7 +2,7 @@
 # author: Ben Callaerts
 # last update: March 3, 2022
 
-## Step 0: Activate environment
+## Activate environment
 cd("C:/Users/User/Documents/Thesis/Modeling")
 
 using Pkg
@@ -12,8 +12,11 @@ using CSV
 using DataFrames
 using YAML
 using PrettyTables
+using JuMP
+using Gurobi
+using Plots
 
-##  Step 1: Input data
+##  Input data
 data = "data-basic"
 
 bus = CSV.read(joinpath(data, "bus.csv"), DataFrame; delim=";")
@@ -24,77 +27,42 @@ incidence = CSV.read(joinpath(data, "incidence.csv"), DataFrame; delim=";")
 susceptance = CSV.read(joinpath(data, "susceptance.csv"), DataFrame; delim=";")
 @info "Data read"
 
-## Step 2: Create model
-using JuMP
-using Gurobi
-m = Model(optimizer_with_attributes(Gurobi.Optimizer))
-@info "Model created"
+## Define functions
 
-# Define sets
-function define_sets!(m::Model)
-    m.ext[:sets] = Dict()
+function create_model()
+	m = Model(optimizer_with_attributes(Gurobi.Optimizer))
 
+	m.ext[:sets] = Dict()
+	get_sets!(m::Model)
+	m.ext[:parameters] = Dict()
+	get_parameters!(m::Model)
+	m.ext[:expressions] = Dict()
+	m.ext[:variables] = Dict()
+	m.ext[:constraints] = Dict()
+
+	return m
+end
+
+function get_sets!(m::Model)
     N = m.ext[:sets][:N] = bus[:,:BusID]
     L = m.ext[:sets][:L] = branch[:,:BranchID]
     P = m.ext[:sets][:P] = plant[:,:GenID]
     Z = m.ext[:sets][:Z] = sort(unique(bus[:,:Zone]))
-
-    return N, L, P, Z
 end
 
-# Build GSK
-function get_gsk_flat()
-	gsk_temp = zeros(Float64, length(N), length(Z))
-	for n in N
-		zone_temp = bus.Zone[bus[:,:BusID].==n][1]
-		gsk_value_temp = 1/size(bus[bus[:,:Zone].==zone_temp,:],1)
-		gsk_temp[findfirst(N .== n), findfirst(Z .== zone_temp)] = gsk_value_temp
-	end
-	return gsk_temp
-end
-
-# Build PTDF
-function build_ptdf(m::Model)
-	N = m.ext[:sets][:N]
-	L = m.ext[:sets][:L]
-	Z = m.ext[:sets][:Z]
-	gsk = m.ext[:parameters][:gsk]
-
-	MWBase = 380^2
-	slack_node = 4
-	slack_position = findfirst(N .== slack_node)
-
-	# Build nodal PTDFs
-	line_sus_mat = Matrix(susceptance)/MWBase*Matrix(incidence)
-	node_sus_mat = transpose(Matrix(incidence))*Matrix(susceptance)/MWBase*Matrix(incidence)
-
-	line_sus_mat_ = line_sus_mat[:, 1:end .!= slack_position]
-	node_sus_mat_ = node_sus_mat[1:end .!= slack_position, 1:end .!= slack_position]
-
-	ptdfN = line_sus_mat_*inv(node_sus_mat_)
-	zero_column = zeros(Float64, length(L), 1)
-	ptdfN = hcat(ptdfN[:,1:(slack_position-1)], zero_column, ptdfN[:,slack_position:end])
-	# PTDF = transpose(PTDF)
-	ptdfZ = ptdfN*gsk
-	return ptdfN, ptdfZ
-end
-
-# Process input parameters
-function process_parameters!(m::Model)
-	m.ext[:parameters] = Dict()
-
+function get_parameters!(m::Model)
 	N = m.ext[:sets][:N]
     P = m.ext[:sets][:P]
     Z = m.ext[:sets][:Z]
 
-	m.ext[:parameters][:gsk] = get_gsk_flat()
+	m.ext[:parameters][:gsk] = create_gsk_flat(m)
 	m.ext[:parameters][:ptdfN], m.ext[:parameters][:ptdfZ] = build_ptdf(m)
 
 	# # starten van nodale ptdf
 	# # gsk als input
 	# # zonale ptdfs berekenen
-	# m.ext[:parameters][:ptdf_Z] = [0.5 0.25 0; 0.5 0.25 0; -0.5 -0.75 0; -0.5 0.25 0]
-	# m.ext[:parameters][:ptdf_N] = [0.5 -0.25 0.25 0; 0.5 0.75 0.25 0; -0.5 -0.25 -0.75 0; -0.5 -0.25 0.25 0]
+	# m.ext[:parameters][:ptdfZ] = [0.5 0.25 0; 0.5 0.25 0; -0.5 -0.75 0; -0.5 0.25 0]
+	# m.ext[:parameters][:ptdfN] = [0.5 -0.25 0.25 0; 0.5 0.75 0.25 0; -0.5 -0.25 -0.75 0; -0.5 -0.25 0.25 0]
 
 	#m.ext[:parameters][:f] = [333.33 133.33 -266.66 -200]
 	#m.ext[:parameters][:f] = [350 150 -250 -250]
@@ -111,19 +79,47 @@ function process_parameters!(m::Model)
     return m
 end
 
-# call functions
-define_sets!(m)
-@info "Sets created"
-process_parameters!(m)
-@info "Parameters created"
+function build_ptdf!(m::Model)
+	N = m.ext[:sets][:N]
+	L = m.ext[:sets][:L]
+	Z = m.ext[:sets][:Z]
+	gsk = m.ext[:parameters][:gsk]
 
-## Step 2b: Additional Functions
-# Get marginal cost of plant p
-function get_mc(p)
-	return plant[plant[:,:GenID].==p, :Costs][1]
+	MWBase = 380^2
+	slack_node = 4
+	slack_position = findfirst(N .== slack_node)
+
+	line_sus_mat = Matrix(susceptance)/MWBase*Matrix(incidence)
+	node_sus_mat = transpose(Matrix(incidence))*Matrix(susceptance)/MWBase*Matrix(incidence)
+
+	line_sus_mat_ = line_sus_mat[:, 1:end .!= slack_position]
+	node_sus_mat_ = node_sus_mat[1:end .!= slack_position, 1:end .!= slack_position]
+
+	ptdfN = line_sus_mat_*inv(node_sus_mat_)
+	zero_column = zeros(Float64, length(L), 1)
+	ptdfN = hcat(ptdfN[:,1:(slack_position-1)], zero_column, ptdfN[:,slack_position:end])
+	# PTDF = transpose(PTDF)
+	ptdfZ = ptdfN*gsk
+	return ptdfN, ptdfZ
 end
 
-# Get maximum capacity
+function create_gsk_flat!(m::Model)
+	N = m.ext[:sets][:N]
+	Z = m.ext[:sets][:Z]
+
+	gsk_temp = zeros(Float64, length(N), length(Z))
+	for n in N
+		zone_temp = bus.Zone[bus[:,:BusID].==n][1]
+		gsk_value_temp = 1/size(bus[bus[:,:Zone].==zone_temp,:],1)
+		gsk_temp[findfirst(N .== n), findfirst(Z .== zone_temp)] = gsk_value_temp
+	end
+	return gsk_temp
+end
+
+function get_mc(p)
+	return plant.Costs[plant[:,:GenID].==p][1]
+end
+
 function get_gen_up(p)
 	return plant.Pmax[plant[:,:GenID].==p][1]
 end
@@ -147,14 +143,39 @@ function find_maximum_mc()
 	return max_temp
 end
 
-## Step 3: Construct your models
+function evaluate_congestion(m::Model)
+	flow = abs.(value.(m.ext[:expressions][:Fp]))
+	capacity = [get_line_cap(l) for l in m.ext[:sets][:L]]
+	overflow = flow.>capacity
+	return any(x->x==1, overflow)
+end
 
-function model1!(m::Model)
-	# Clear m.ext entries
-	m.ext[:variables] = Dict()
-	m.ext[:expressions] = Dict()
-	m.ext[:constraints] = Dict()
+function write_to_CSV(variable, heading, csv)
+	data = zeros(Float64, 1, length(heading))
+	data[:] = value.(variable[:])
+	dataframe = DataFrame(data, :auto)
+	rename!(dataframe, Dict(names(dataframe)[i] => Symbol.(heading[i]) for i = 1:ncol(dataframe)))
+	CSV.write(joinpath("results", csv), dataframe,  delim=';', decimal=',')
+end
 
+## Market coupling
+m = create_model()
+@info "Market coupling model created"
+
+# function modelx!(m::Model)
+	## Model
+	# modelxmin1!()
+	## Sets
+	## Parameters
+	## Variables
+	## Expressions
+	## Objective
+	## Constraints
+	#@info "Model x executed"
+	#return m
+# end
+
+function marketcoupling1!(m::Model)
 	# Sets
 	Z = m.ext[:sets][:Z]
 	N = m.ext[:sets][:N]
@@ -162,8 +183,8 @@ function model1!(m::Model)
 	P = m.ext[:sets][:P]
 
 	# Parameters
-	ptdf_Z = m.ext[:parameters][:ptdf_Z]
-	ptdf_N = m.ext[:parameters][:ptdf_N]
+	ptdfN = m.ext[:parameters][:ptdfN]
+	ptdfZ = m.ext[:parameters][:ptdfZ]
 	np = m.ext[:parameters][:np]
 	f = m.ext[:parameters][:f]
 	p_in_n = m.ext[:parameters][:p_in_n]
@@ -178,10 +199,10 @@ function model1!(m::Model)
         sum(GEN[p]*get_mc(p) for p in p_in_z[z])
     	)
 	Fp = m.ext[:expressions][:Fp] = @expression(m, [l=L],
-		sum(ptdf_N[l,n]*(GEN[n]-get_dem(n)) for n=N)
+		sum(ptdfN[l,n]*(GEN[n]-get_dem(n)) for n=N)
 		)
 	Fref = m.ext[:expressions][:Fref] = @expression(m, [l=L],
-		f[l] - sum(ptdf_Z[l,z]*np[z] for z in Z)
+		f[l] - sum(ptdfZ[l,z]*np[z] for z in Z)
 		)
 	RAMpos = m.ext[:expressions][:RAMpos] = @expression(m, [l=L],
 		get_line_cap(l)-Fref[l]
@@ -190,7 +211,7 @@ function model1!(m::Model)
 		get_line_cap(l)+Fref[l]
 		)
 	Fc = m.ext[:expressions][:Fc] = @expression(m, [l=L],
-		Fref[l]+sum(ptdf_Z[l,z]*NP[z] for z in Z)
+		Fref[l]+sum(ptdfZ[l,z]*NP[z] for z in Z)
 		)
 
 	# Objective
@@ -205,13 +226,13 @@ function model1!(m::Model)
 		sum(GEN[p] for p in p_in_n[n])
 		)
 
-	@info "Model 1 executed"
+	@info "Market coupling 1 executed"
 	return m
 end
 
-function model2!(m::Model)
+function marketcoupling2!(m::Model)
 	# Model
-	model1!(m)
+	marketcoupling1!(m)
 
 	# Sets
 	Z = m.ext[:sets][:Z]
@@ -235,13 +256,13 @@ function model2!(m::Model)
 		sum(GEN[p] for p in p_in_z[z])
 		)
 
-	@info "Model 2 executed"
+	@info "Market coupling 2 executed"
 	return m
 end
 
-function model3!(m::Model)
+function marketcoupling3!(m::Model)
 	# Model
-	model2!(m)
+	marketcoupling2!(m)
 
 	# Sets
 	Z = m.ext[:sets][:Z]
@@ -270,20 +291,20 @@ function model3!(m::Model)
 		sum(NP[z] for z in Z) == 0
 		)
 
-	@info "Model 3 executed"
+	@info "Market coupling 3 executed"
 	return m
 end
 
-function model4!(m::Model)
+function marketcoupling4!(m::Model)
 	# Model
-	model3!(m)
+	marketcoupling3!(m)
 
 	# Sets
 	Z = m.ext[:sets][:Z]
 	L = m.ext[:sets][:L]
 
 	# Parameters
-	ptdf_Z = m.ext[:parameters][:ptdf_Z]
+	ptdfZ = m.ext[:parameters][:ptdfZ]
 	np = m.ext[:parameters][:np]
 	f = m.ext[:parameters][:f]
 
@@ -294,121 +315,105 @@ function model4!(m::Model)
 	m.ext[:constraints][:con9j] = @constraint(m,[l=L],
 		get_line_cap(l) - f[l]
 		>=
-		sum(ptdf_Z[l,z]*(NP[z] - np[z]) for z in Z)
+		sum(ptdfZ[l,z]*(NP[z] - np[z]) for z in Z)
 	 	)
 
 	m.ext[:constraints][:con9k] = @constraint(m, [l=L],
 		-get_line_cap(l) - f[l]
 		<=
-		sum(ptdf_Z[l,z]*(NP[z]-np[z]) for z in Z)
+		sum(ptdfZ[l,z]*(NP[z]-np[z]) for z in Z)
 		)
 
-	@info "Model 4 executed"
+	@info "Market coupling 4 executed"
 	return m
 end
 
-function model5!(n::Model)
-	# Model
-	n.ext[:variables] = Dict()
-	n.ext[:expressions] = Dict()
-	n.ext[:constraints] = Dict()
+marketcoupling4!(m)
+optimize!(m)
+@info "Market coupling optimised"
 
-	# Sets
-	N = n.ext[:sets][:N]
-    L = n.ext[:sets][:L]
-    P = n.ext[:sets][:P]
-    Z = n.ext[:sets][:Z]
+## Congestion management
+congestion = evaluate_congestion(m)
 
-	# Parameters
-	g = n.ext[:parameters][:g]
-	n_in_z = n.ext[:parameters][:n_in_z]
-	p_in_z = n.ext[:parameters][:p_in_z]
-	p_in_n = n.ext[:parameters][:p_in_n]
-	a=0.25
-	ptdf_N = n.ext[:parameters][:ptdf_N]
+if congestion
+	c = create_model()
+	c.ext[:parameters][:g] = zeros(Float64, 1, length(m.ext[:sets][:P]))
+	c.ext[:parameters][:g][:] = value.(m.ext[:variables][:GEN])[:]
+	@info "Congestion management created"
 
-	# Variables
-	UP = n.ext[:variables][:UP] = @variable(n, [p=P], lower_bound=0, base_name="upward redispatch")
-	DOWN = n.ext[:variables][:DOWN] = @variable(n, [p=P], lower_bound=0, base_name="downward redispatch")
+	function congestion1!(c::Model)
+		# Model
+		c.ext[:variables] = Dict()
+		c.ext[:expressions] = Dict()
+		c.ext[:constraints] = Dict()
 
-	# Expressions
-	CC = n.ext[:expressions][:CC] = @expression(n,[z=Z],
-		sum((1+a)*UP[p]*get_mc(p)
-		- (1-a)*DOWN[p]*get_mc(p) for p in p_in_z[z])
-		)
+		# Sets
+		N = c.ext[:sets][:N]
+	    L = c.ext[:sets][:L]
+	    P = c.ext[:sets][:P]
+	    Z = c.ext[:sets][:Z]
 
-	# Objective
-	n.ext[:objective] = @objective(n, Min,
-		sum(CC[z] for z in Z)
-		)
+		# Parameters
+		g = c.ext[:parameters][:g]
+		n_in_z = c.ext[:parameters][:n_in_z]
+		p_in_z = c.ext[:parameters][:p_in_z]
+		p_in_n = c.ext[:parameters][:p_in_n]
+		a=0.25
+		ptdfN = c.ext[:parameters][:ptdfN]
 
-	# Constraints
-	n.ext[:constraints][:con15b] = @constraint(n,
-		sum(UP[p] for p in P) == sum(DOWN[p] for p in P)
-		)
-	n.ext[:constraints][:con15c] = @constraint(n, [l=L],
-		-get_line_cap(l)
-		<=
-		sum(ptdf_N[l,n]*
-		(sum(g[p]+UP[p]-DOWN[p] for p in p_in_n[n]) - get_dem(n))
-		for n in N)
-		<=
-		get_line_cap(l)
-		)
-	n.ext[:constraints][:con15d] = @constraint(n, [p=P],
-		UP[p] <= get_gen_up(p) - g[p]
-		)
-	n.ext[:constraints][:con15e] = @constraint(n, [p=P],
-		DOWN[p] <= g[p]
-		)
+		# Variables
+		UP = c.ext[:variables][:UP] = @variable(c, [p=P], lower_bound=0, base_name="upward redispatch")
+		DOWN = c.ext[:variables][:DOWN] = @variable(c, [p=P], lower_bound=0, base_name="downward redispatch")
 
-	@info "Model 5 executed"
-	return n
+		# Expressions
+		CC = c.ext[:expressions][:CC] = @expression(c,[z=Z],
+			sum((1+a)*UP[p]*get_mc(p)
+			- (1-a)*DOWN[p]*get_mc(p) for p in p_in_z[z])
+			)
+
+		# Objective
+		c.ext[:objective] = @objective(c, Min,
+			sum(CC[z] for z in Z)
+			)
+
+		# Constraints
+		c.ext[:constraints][:con15b] = @constraint(c,
+			sum(UP[p] for p in P) == sum(DOWN[p] for p in P)
+			)
+		c.ext[:constraints][:con15c] = @constraint(c, [l=L],
+			-get_line_cap(l)
+			<=
+			sum(ptdfN[l,n]*
+			(sum(g[p]+UP[p]-DOWN[p] for p in p_in_n[n]) - get_dem(n))
+			for n in N)
+			<=
+			get_line_cap(l)
+			)
+		c.ext[:constraints][:con15d] = @constraint(c, [p=P],
+			UP[p] <= get_gen_up(p) - g[p]
+			)
+		c.ext[:constraints][:con15e] = @constraint(c, [p=P],
+			DOWN[p] <= g[p]
+			)
+
+		@info "Congestion management 1 executed"
+		return c
+	end
+
+	congestion1!(c)
+	optimize!(c)
+	@info "Congestion management optimised"
+else
+	@info "No congestion management needed"
 end
 
-# function modelx!(m::Model)
-	## Model
-	# modelxmin1!()
-	## Sets
-	## Parameters
-	## Variables
-	## Expressions
-	## Objective
-	## Constraints
-	#@info "Model x executed"
-	#return m
-# end
+## Exporting to CSV
+write_to_CSV(m.ext[:variables][:GEN], m.ext[:sets][:P], "g.csv")
 
-#model1!(m)
-#model2!(m)
-#model3!(m)
-#model4!(m)
-
-model4!(m)
-optimize!(m)
-g = value.(m.ext[:variables][:GEN])
-# if redispatch nodig, doe dan redispatch
-# anders niet
-n = Model(optimizer_with_attributes(Gurobi.Optimizer))
-define_sets!(n)
-process_parameters!(n)
-n.ext[:parameters][:g] = g
-
-model5!(n)
-
-## Step 4: Solve
-optimize!(n)
-@info "Model optimised"
-
-println("Termination status: ", termination_status(n) )
-println("Objective: ", value.(n.ext[:objective]))
-println("")
-print(n)
-println("")
-
+## Post-processing
 nodes = DataFrame(
 	node = [n for n in m.ext[:sets][:N]],
-	D = [get_dem(n) for n in m.ext[:sets][:N]],
+	D = [get_dem(c) for n in m.ext[:sets][:N]],
 	GMAX = [get_gen_up(p) for p in m.ext[:sets][:P]],
 	MC = [get_mc(p) for p in m.ext[:sets][:P]],
 	GEN = [value.(m.ext[:variables][:GEN][p]) for p in m.ext[:sets][:P]]
@@ -442,7 +447,3 @@ zones = DataFrame(
 CSV.write("C:/Users/User/Documents/Thesis/Modeling/results/zones.csv", zones,  delim=';', decimal=',')
 
 #pretty_table(zones, header=["zone", "NP[MW]", "CG[EUR]", "CC[EUR]"])
-
-
-## Step 5: Interpretation
-using Plots
