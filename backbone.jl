@@ -14,10 +14,10 @@ using YAML
 using PrettyTables
 using JuMP
 using Gurobi
-using Plots
+# using Plots
 
 ##  Input data
-data = "data-basic"
+data = "data-advanced"
 
 bus = CSV.read(joinpath(data, "bus.csv"), DataFrame; delim=";")
 branch = CSV.read(joinpath(data, "branch.csv"), DataFrame; delim=";")
@@ -25,6 +25,9 @@ plant = CSV.read(joinpath(data, "plant.csv"), DataFrame; delim=";")
 load = CSV.read(joinpath(data, "load.csv"), DataFrame; delim=";")
 incidence = CSV.read(joinpath(data, "incidence.csv"), DataFrame; delim=";")
 susceptance = CSV.read(joinpath(data, "susceptance.csv"), DataFrame; delim=";")
+
+# CSV.write(joinpath(data, "file.csv"), file; delim=';', decimal='.')
+
 @info "Data read"
 
 ## Define functions
@@ -48,6 +51,7 @@ function get_sets!(m::Model)
     L = m.ext[:sets][:L] = branch[:,:BranchID]
     P = m.ext[:sets][:P] = plant[:,:GenID]
     Z = m.ext[:sets][:Z] = sort(unique(bus[:,:Zone]))
+	Z_FBMC = m.ext[:sets][:Z_FBMC] = [z for z in Z if length(z)<3]
 end
 
 function get_parameters!(m::Model)
@@ -55,38 +59,29 @@ function get_parameters!(m::Model)
     P = m.ext[:sets][:P]
     Z = m.ext[:sets][:Z]
 
+	m.ext[:parameters][:X] = 0.5
+
 	m.ext[:parameters][:gsk] = create_gsk_flat(m)
 	m.ext[:parameters][:ptdfN], m.ext[:parameters][:ptdfZ] = build_ptdf(m)
-
-	# # starten van nodale ptdf
-	# # gsk als input
-	# # zonale ptdfs berekenen
-	# m.ext[:parameters][:ptdfZ] = [0.5 0.25 0; 0.5 0.25 0; -0.5 -0.75 0; -0.5 0.25 0]
-	# m.ext[:parameters][:ptdfN] = [0.5 -0.25 0.25 0; 0.5 0.75 0.25 0; -0.5 -0.25 -0.75 0; -0.5 -0.25 0.25 0]
-
-	#m.ext[:parameters][:f] = [333.33 133.33 -266.66 -200]
-	#m.ext[:parameters][:f] = [350 150 -250 -250]
-	m.ext[:parameters][:f] = [350 150 -250 -150]
-	#m.ext[:parameters][:f] = [0 0 0 0]
-	#m.ext[:parameters][:np] = [333.33 66.66 -400]
-	#m.ext[:parameters][:np] = [350 0 -400]
-	m.ext[:parameters][:np] = [300 100 -400]
-	#m.ext[:parameters][:np] = [0 0 0]
 	m.ext[:parameters][:p_in_n] = Dict(map(n -> n => [p for p in P if plant[plant[:,:GenID].==p, :OnBus][1] == n], N))
 	m.ext[:parameters][:p_in_z] = Dict(map(z -> z => [p for p in P if plant[plant[:,:GenID].==p, :Zone][1] == z], Z))
 	m.ext[:parameters][:n_in_z] = Dict(map(z -> z => [n for n in N if bus[bus[:,:BusID].==n, :Zone][1] == z], Z))
-
-    return m
 end
 
-function build_ptdf!(m::Model)
+function build_ptdf(m::Model)
 	N = m.ext[:sets][:N]
 	L = m.ext[:sets][:L]
 	Z = m.ext[:sets][:Z]
 	gsk = m.ext[:parameters][:gsk]
 
 	MWBase = 380^2
-	slack_node = 4
+	if data == "data-basic"
+		slack_node = 4
+	elseif data == "data-advanced"
+		slack_node = 68
+	else
+		@error "Could not assign a slack node"
+	end
 	slack_position = findfirst(N .== slack_node)
 
 	line_sus_mat = Matrix(susceptance)/MWBase*Matrix(incidence)
@@ -103,7 +98,7 @@ function build_ptdf!(m::Model)
 	return ptdfN, ptdfZ
 end
 
-function create_gsk_flat!(m::Model)
+function create_gsk_flat(m::Model)
 	N = m.ext[:sets][:N]
 	Z = m.ext[:sets][:Z]
 
@@ -125,7 +120,8 @@ function get_gen_up(p)
 end
 
 function get_dem(n)
-	return load[1,n]
+	N = m.ext[:sets][:N]
+	return load[1,findfirst(n.==N)]
 end
 
 function get_line_cap(l)
@@ -141,6 +137,25 @@ function find_maximum_mc()
         end
     end
 	return max_temp
+end
+
+function get_physical_flow(l)
+	N = m.ext[:sets][:N]
+	L = m.ext[:sets][:L]
+	p_in_n = m.ext[:parameters][:p_in_n]
+	GEN = m.ext[:variables][:GEN]
+	ptdfN = m.ext[:parameters][:ptdfN]
+
+	GEN_N=Dict()
+	for n in N
+		if isempty(p_in_n[n])
+			GEN_N[n]=0
+		else
+			GEN_N[n] = sum(GEN[p] for p=p_in_n[n])
+		end
+	end
+
+	return sum(ptdfN[findfirst(L.==l),findfirst(N.==n)]*(GEN_N[n]-get_dem(n)) for n=N)
 end
 
 function evaluate_congestion(m::Model)
@@ -185,10 +200,9 @@ function marketcoupling1!(m::Model)
 	# Parameters
 	ptdfN = m.ext[:parameters][:ptdfN]
 	ptdfZ = m.ext[:parameters][:ptdfZ]
-	np = m.ext[:parameters][:np]
-	f = m.ext[:parameters][:f]
 	p_in_n = m.ext[:parameters][:p_in_n]
 	p_in_z = m.ext[:parameters][:p_in_z]
+	X = m.ext[:parameters][:X]
 
 	# Variables
 	GEN = m.ext[:variables][:GEN] = @variable(m, [p=P], lower_bound=0, upper_bound=get_gen_up(p), base_name="generation")
@@ -199,20 +213,20 @@ function marketcoupling1!(m::Model)
         sum(GEN[p]*get_mc(p) for p in p_in_z[z])
     	)
 	Fp = m.ext[:expressions][:Fp] = @expression(m, [l=L],
-		sum(ptdfN[l,n]*(GEN[n]-get_dem(n)) for n=N)
+		get_physical_flow(l)
 		)
-	Fref = m.ext[:expressions][:Fref] = @expression(m, [l=L],
-		f[l] - sum(ptdfZ[l,z]*np[z] for z in Z)
+
+
+	# Fref = m.ext[:expressions][:Fref] = @expression(m, [l=L],
+	# 	f[l] - sum(ptdfZ[l,z]*np[z] for z in Z)
+	# 	)
+	RAM = m.ext[:expressions][:RAM] = @expression(m, [l=L],
+		# get_line_cap(l)-Fref[l]
+		X*get_line_cap(l)
 		)
-	RAMpos = m.ext[:expressions][:RAMpos] = @expression(m, [l=L],
-		get_line_cap(l)-Fref[l]
-		)
-	RAMneg = m.ext[:expressions][:RAMneg] = @expression(m, [l=L],
-		get_line_cap(l)+Fref[l]
-		)
-	Fc = m.ext[:expressions][:Fc] = @expression(m, [l=L],
-		Fref[l]+sum(ptdfZ[l,z]*NP[z] for z in Z)
-		)
+	# Fc = m.ext[:expressions][:Fc] = @expression(m, [l=L],
+	# 	Fref[l]+sum(ptdfZ[l,z]*NP[z] for z in Z)
+	# 	)
 
 	# Objective
 	m.ext[:objective] = @objective(m, Min,
@@ -301,36 +315,36 @@ function marketcoupling4!(m::Model)
 
 	# Sets
 	Z = m.ext[:sets][:Z]
+	Z_FBMC = m.ext[:sets][:Z_FBMC]
 	L = m.ext[:sets][:L]
 
 	# Parameters
 	ptdfZ = m.ext[:parameters][:ptdfZ]
-	np = m.ext[:parameters][:np]
-	f = m.ext[:parameters][:f]
+	X = m.ext[:parameters][:X]
 
 	# Variables
 	NP = m.ext[:variables][:NP]
 
 	# Constraints
 	m.ext[:constraints][:con9j] = @constraint(m,[l=L],
-		get_line_cap(l) - f[l]
-		>=
-		sum(ptdfZ[l,z]*(NP[z] - np[z]) for z in Z)
-	 	)
-
-	m.ext[:constraints][:con9k] = @constraint(m, [l=L],
-		-get_line_cap(l) - f[l]
+		-X*get_line_cap(l)
 		<=
-		sum(ptdfZ[l,z]*(NP[z]-np[z]) for z in Z)
-		)
+		sum(ptdfZ[findfirst(L.==l),findfirst(Z.==z)]*NP[z] for z in Z_FBMC)
+		<=
+		X*get_line_cap(l)
+	 	)
 
 	@info "Market coupling 4 executed"
 	return m
 end
 
-marketcoupling4!(m)
+marketcoupling3!(m)
 optimize!(m)
 @info "Market coupling optimised"
+
+if termination_status(m) == INFEASIBLE
+	error("Market clearing is infeasible")
+end
 
 ## Congestion management
 congestion = evaluate_congestion(m)
@@ -383,7 +397,7 @@ if congestion
 		c.ext[:constraints][:con15c] = @constraint(c, [l=L],
 			-get_line_cap(l)
 			<=
-			sum(ptdfN[l,n]*
+			sum(ptdfN[findfirst(L.==l),findfirst(N.==n)]*
 			(sum(g[p]+UP[p]-DOWN[p] for p in p_in_n[n]) - get_dem(n))
 			for n in N)
 			<=
@@ -403,6 +417,10 @@ if congestion
 	congestion1!(c)
 	optimize!(c)
 	@info "Congestion management optimised"
+
+	if termination_status(c) == INFEASIBLE_OR_UNBOUNDED
+		@warn "Congestion management is infeasible or unbounded"
+	end
 else
 	@info "No congestion management needed"
 end
@@ -410,40 +428,47 @@ end
 ## Exporting to CSV
 write_to_CSV(m.ext[:variables][:GEN], m.ext[:sets][:P], "g.csv")
 
+
 ## Post-processing
-nodes = DataFrame(
-	node = [n for n in m.ext[:sets][:N]],
-	D = [get_dem(c) for n in m.ext[:sets][:N]],
-	GMAX = [get_gen_up(p) for p in m.ext[:sets][:P]],
-	MC = [get_mc(p) for p in m.ext[:sets][:P]],
-	GEN = [value.(m.ext[:variables][:GEN][p]) for p in m.ext[:sets][:P]]
-)
 
-CSV.write("C:/Users/User/Documents/Thesis/Modeling/results/nodes.csv", nodes,  delim=';', decimal=',')
+# print("\nGEN\n", value.(m.ext[:variables][:GEN]))
+# print("\nFp\n", value.(m.ext[:expressions][:Fp]))
 
-pretty_table(nodes, header=["node", "Dem[MW]", "Gmax[MW]","MC[€/MWh]","GEN[MW]"])
 
-lines = DataFrame(
-	line=["1-2","2-4","4-3","3-1"],
-	cap=[get_line_cap(l) for l in m.ext[:sets][:L]],
-	Fref=[value.(m.ext[:expressions][:Fref][l]) for l in m.ext[:sets][:L]],
-	Fc=[value.(m.ext[:expressions][:Fc][l]) for l in m.ext[:sets][:L]],
-	Fp=[value.(m.ext[:expressions][:Fp][l]) for l in m.ext[:sets][:L]],
-	RAMpos=[value.(m.ext[:expressions][:RAMpos][l]) for l in m.ext[:sets][:L]],
-	RAMneg=[value.(m.ext[:expressions][:RAMneg][l]) for l in m.ext[:sets][:L]]
-)
 
-CSV.write("C:/Users/User/Documents/Thesis/Modeling/results/lines.csv", lines,  delim=';', decimal=',')
-
-pretty_table(lines, header=["line","cap[MW]","Fref[MW]","Fc[MW]","Fp[MW]","RAM+[MW]","RAM-[MW]"])
-
-zones = DataFrame(
-	zone=["A","B","C"],
-	NP=[value.(m.ext[:variables][:NP][z]) for z in m.ext[:sets][:Z]],
-	CG=[value.(m.ext[:expressions][:CG][z]) for z in m.ext[:sets][:Z]],
-	#CC=[value.(m.ext[:expressions][:CC][z]) for z in m.ext[:sets][:Z]]
-)
-
-CSV.write("C:/Users/User/Documents/Thesis/Modeling/results/zones.csv", zones,  delim=';', decimal=',')
-
-#pretty_table(zones, header=["zone", "NP[MW]", "CG[EUR]", "CC[EUR]"])
+# nodes = DataFrame(
+# 	node = [n for n in m.ext[:sets][:N]],
+# 	D = [get_dem(c) for n in m.ext[:sets][:N]],
+# 	GMAX = [get_gen_up(p) for p in m.ext[:sets][:P]],
+# 	MC = [get_mc(p) for p in m.ext[:sets][:P]],
+# 	GEN = [value.(m.ext[:variables][:GEN][p]) for p in m.ext[:sets][:P]]
+# )
+#
+# CSV.write("C:/Users/User/Documents/Thesis/Modeling/results/nodes.csv", nodes,  delim=';', decimal=',')
+#
+# pretty_table(nodes, header=["node", "Dem[MW]", "Gmax[MW]","MC[€/MWh]","GEN[MW]"])
+#
+# lines = DataFrame(
+# 	line=["1-2","2-4","4-3","3-1"],
+# 	cap=[get_line_cap(l) for l in m.ext[:sets][:L]],
+# 	Fref=[value.(m.ext[:expressions][:Fref][l]) for l in m.ext[:sets][:L]],
+# 	Fc=[value.(m.ext[:expressions][:Fc][l]) for l in m.ext[:sets][:L]],
+# 	Fp=[value.(m.ext[:expressions][:Fp][l]) for l in m.ext[:sets][:L]],
+# 	RAMpos=[value.(m.ext[:expressions][:RAMpos][l]) for l in m.ext[:sets][:L]],
+# 	RAMneg=[value.(m.ext[:expressions][:RAMneg][l]) for l in m.ext[:sets][:L]]
+# )
+#
+# CSV.write("C:/Users/User/Documents/Thesis/Modeling/results/lines.csv", lines,  delim=';', decimal=',')
+#
+# pretty_table(lines, header=["line","cap[MW]","Fref[MW]","Fc[MW]","Fp[MW]","RAM+[MW]","RAM-[MW]"])
+#
+# zones = DataFrame(
+# 	zone=["A","B","C"],
+# 	NP=[value.(m.ext[:variables][:NP][z]) for z in m.ext[:sets][:Z]],
+# 	CG=[value.(m.ext[:expressions][:CG][z]) for z in m.ext[:sets][:Z]],
+# 	#CC=[value.(m.ext[:expressions][:CC][z]) for z in m.ext[:sets][:Z]]
+# )
+#
+# CSV.write("C:/Users/User/Documents/Thesis/Modeling/results/zones.csv", zones,  delim=';', decimal=',')
+#
+# #pretty_table(zones, header=["zone", "NP[MW]", "CG[EUR]", "CC[EUR]"])
