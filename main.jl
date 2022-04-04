@@ -1,6 +1,6 @@
 ## Flow Based Market Coupling
 # author: Ben Callaerts
-# last update: March 3, 2022
+# last update: March 30, 2022
 
 ## Activate environment
 cd("C:/Users/User/Documents/Thesis/Modeling")
@@ -17,16 +17,16 @@ using Gurobi
 # using Plots
 
 ##  Input data
-data = "data-advanced"
+case = "data-advanced"
 
-bus = CSV.read(joinpath(data, "bus.csv"), DataFrame; delim=";")
-branch = CSV.read(joinpath(data, "branch.csv"), DataFrame; delim=";")
-plant = CSV.read(joinpath(data, "plant.csv"), DataFrame; delim=";")
-load = CSV.read(joinpath(data, "load.csv"), DataFrame; delim=";")
-incidence = CSV.read(joinpath(data, "incidence.csv"), DataFrame; delim=";")
-susceptance = CSV.read(joinpath(data, "susceptance.csv"), DataFrame; delim=";")
+bus = CSV.read(joinpath(case, "bus.csv"), DataFrame)
+branch = CSV.read(joinpath(case, "branch.csv"), DataFrame)
+plant = CSV.read(joinpath(case, "plant.csv"), DataFrame)
+load = CSV.read(joinpath(case, "load.csv"), DataFrame)
+incidence = CSV.read(joinpath(case, "incidence.csv"), DataFrame)
+susceptance = CSV.read(joinpath(case, "susceptance.csv"), DataFrame)
 
-# CSV.write(joinpath(data, "file.csv"), file; delim=';', decimal='.')
+# CSV.write(joinpath(data, "file.csv"), file; delim=',', decimal='.')
 
 @info "Data read"
 
@@ -75,9 +75,9 @@ function build_ptdf(m::Model)
 	gsk = m.ext[:parameters][:gsk]
 
 	MWBase = 380^2
-	if data == "data-basic"
+	if case == "data-basic"
 		slack_node = 4
-	elseif data == "data-advanced"
+	elseif case == "data-advanced"
 		slack_node = 68
 	else
 		@error "Could not assign a slack node"
@@ -170,7 +170,7 @@ function write_to_CSV(variable, heading, csv)
 	data[:] = value.(variable[:])
 	dataframe = DataFrame(data, :auto)
 	rename!(dataframe, Dict(names(dataframe)[i] => Symbol.(heading[i]) for i = 1:ncol(dataframe)))
-	CSV.write(joinpath("results", csv), dataframe,  delim=';', decimal=',')
+	CSV.write(joinpath(case, csv), dataframe,  delim=',', decimal='.')
 end
 
 ## Market coupling
@@ -215,7 +215,6 @@ function marketcoupling1!(m::Model)
 	Fp = m.ext[:expressions][:Fp] = @expression(m, [l=L],
 		get_physical_flow(l)
 		)
-
 
 	# Fref = m.ext[:expressions][:Fref] = @expression(m, [l=L],
 	# 	f[l] - sum(ptdfZ[l,z]*np[z] for z in Z)
@@ -338,7 +337,7 @@ function marketcoupling4!(m::Model)
 	return m
 end
 
-marketcoupling3!(m)
+marketcoupling4!(m)
 optimize!(m)
 @info "Market coupling optimised"
 
@@ -426,15 +425,24 @@ else
 end
 
 ## Exporting to CSV
-write_to_CSV(m.ext[:variables][:GEN], m.ext[:sets][:P], "g.csv")
+write_to_CSV(m.ext[:sets][:L], m.ext[:sets][:L], "L.csv")
+write_to_CSV(m.ext[:variables][:GEN], m.ext[:sets][:P], "GEN.csv")
+write_to_CSV(m.ext[:variables][:NP], m.ext[:sets][:Z], "NP.csv")
+write_to_CSV(m.ext[:expressions][:CG], m.ext[:sets][:Z], "CG.csv")
+write_to_CSV(m.ext[:expressions][:Fp], m.ext[:sets][:L], "Fp.csv")
 
+if congestion
+	write_to_CSV(c.ext[:variables][:UP], c.ext[:sets][:P], "UP.csv")
+	write_to_CSV(c.ext[:variables][:DOWN], c.ext[:sets][:P], "DOWN.csv")
+	write_to_CSV(c.ext[:expressions][:CC], c.ext[:sets][:Z], "CC.csv")
+end
 
 ## Post-processing
 
 # print("\nGEN\n", value.(m.ext[:variables][:GEN]))
+# print("\nUP\n", value.(c.ext[:variables][:UP]))
+# print("\nDOWN\n", value.(c.ext[:variables][:DOWN]))
 # print("\nFp\n", value.(m.ext[:expressions][:Fp]))
-
-
 
 # nodes = DataFrame(
 # 	node = [n for n in m.ext[:sets][:N]],
