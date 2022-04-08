@@ -1,6 +1,6 @@
 ## Flow Based Market Coupling
 # author: Ben Callaerts
-# last update: March 30, 2022
+# last update: April 8, 2022
 
 ## Activate environment
 cd("C:/Users/User/Documents/Thesis/Modeling")
@@ -39,8 +39,8 @@ function create_model()
 	get_sets!(m::Model)
 	m.ext[:parameters] = Dict()
 	get_parameters!(m::Model)
-	m.ext[:expressions] = Dict()
 	m.ext[:variables] = Dict()
+	m.ext[:expressions] = Dict()
 	m.ext[:constraints] = Dict()
 
 	return m
@@ -51,7 +51,6 @@ function get_sets!(m::Model)
     L = m.ext[:sets][:L] = branch[:,:BranchID]
     P = m.ext[:sets][:P] = plant[:,:GenID]
     Z = m.ext[:sets][:Z] = sort(unique(bus[:,:Zone]))
-	Z_FBMC = m.ext[:sets][:Z_FBMC] = [z for z in Z if length(z)<3]
 end
 
 function get_parameters!(m::Model)
@@ -139,7 +138,7 @@ function find_maximum_mc()
 	return max_temp
 end
 
-function get_physical_flow(l)
+function get_physical_flow(m::Model,l)
 	N = m.ext[:sets][:N]
 	L = m.ext[:sets][:L]
 	p_in_n = m.ext[:parameters][:p_in_n]
@@ -159,7 +158,7 @@ function get_physical_flow(l)
 end
 
 function evaluate_congestion(m::Model)
-	flow = abs.(value.(m.ext[:expressions][:Fp]))
+	flow = abs.(value.(m.ext[:expressions][:Fp1]))
 	capacity = [get_line_cap(l) for l in m.ext[:sets][:L]]
 	overflow = flow.>capacity
 	return any(x->x==1, overflow)
@@ -209,23 +208,21 @@ function marketcoupling1!(m::Model)
 	NP = m.ext[:variables][:NP] = @variable(m, [z=Z], base_name="net position")
 
 	# Expressions
-	CG = m.ext[:expressions][:CG] = @expression(m,[z=Z],
+	CG = m.ext[:expressions][:CG] = @expression(m, [z=Z],
         sum(GEN[p]*get_mc(p) for p in p_in_z[z])
     	)
-	Fp = m.ext[:expressions][:Fp] = @expression(m, [l=L],
-		get_physical_flow(l)
+	Fp1 = m.ext[:expressions][:Fp1] = @expression(m, [l=L],
+		get_physical_flow(m,l)
 		)
-
-	# Fref = m.ext[:expressions][:Fref] = @expression(m, [l=L],
-	# 	f[l] - sum(ptdfZ[l,z]*np[z] for z in Z)
-	# 	)
+	Fc1 = m.ext[:expressions][:Fc1] = @expression(m, [l=L],
+		sum(ptdfZ[findfirst(L.==l),findfirst(Z.==z)]*NP[z] for z in Z)
+		)
+	Fref1 = m.ext[:expressions][:Fref1] = @expression(m, [l=L],
+		Fp1[l]-Fc1[l]
+		)
 	RAM = m.ext[:expressions][:RAM] = @expression(m, [l=L],
-		# get_line_cap(l)-Fref[l]
 		X*get_line_cap(l)
 		)
-	# Fc = m.ext[:expressions][:Fc] = @expression(m, [l=L],
-	# 	Fref[l]+sum(ptdfZ[l,z]*NP[z] for z in Z)
-	# 	)
 
 	# Objective
 	m.ext[:objective] = @objective(m, Min,
@@ -314,7 +311,6 @@ function marketcoupling4!(m::Model)
 
 	# Sets
 	Z = m.ext[:sets][:Z]
-	Z_FBMC = m.ext[:sets][:Z_FBMC]
 	L = m.ext[:sets][:L]
 
 	# Parameters
@@ -328,7 +324,7 @@ function marketcoupling4!(m::Model)
 	m.ext[:constraints][:con9j] = @constraint(m,[l=L],
 		-X*get_line_cap(l)
 		<=
-		sum(ptdfZ[findfirst(L.==l),findfirst(Z.==z)]*NP[z] for z in Z_FBMC)
+		sum(ptdfZ[findfirst(L.==l),findfirst(Z.==z)]*NP[z] for z in Z)
 		<=
 		X*get_line_cap(l)
 	 	)
@@ -346,14 +342,13 @@ if termination_status(m) == INFEASIBLE
 end
 
 ## Congestion management
+c = create_model()
+c.ext[:parameters][:g] = zeros(Float64, 1, length(m.ext[:sets][:P]))
+c.ext[:parameters][:g][:] = value.(m.ext[:variables][:GEN])[:]
 congestion = evaluate_congestion(m)
+#congestion = true
 
 if congestion
-	c = create_model()
-	c.ext[:parameters][:g] = zeros(Float64, 1, length(m.ext[:sets][:P]))
-	c.ext[:parameters][:g][:] = value.(m.ext[:variables][:GEN])[:]
-	@info "Congestion management created"
-
 	function congestion1!(c::Model)
 		# Model
 		c.ext[:variables] = Dict()
@@ -373,6 +368,7 @@ if congestion
 		p_in_n = c.ext[:parameters][:p_in_n]
 		a=0.25
 		ptdfN = c.ext[:parameters][:ptdfN]
+		ptdfZ = c.ext[:parameters][:ptdfZ]
 
 		# Variables
 		UP = c.ext[:variables][:UP] = @variable(c, [p=P], lower_bound=0, base_name="upward redispatch")
@@ -383,6 +379,21 @@ if congestion
 			sum((1+a)*UP[p]*get_mc(p)
 			- (1-a)*DOWN[p]*get_mc(p) for p in p_in_z[z])
 			)
+		GEN = c.ext[:expressions][:GEN] = @expression(c, [p=P],
+			g[p] + UP[p] - DOWN[p]
+			)
+		NP = c.ext[:expressions][:NP] = @expression(c, [z=Z],
+			sum(GEN[p] for p in p_in_z[z])-sum(get_dem(n) for n in n_in_z[z])
+			)
+		# Fp0 = c.ext[:expressions][:Fp0] = @expression(c, [l=L],
+		# 	get_physical_flow(c,l)
+		# 	)
+		Fc0 = c.ext[:expressions][:Fc0] = @expression(c, [l=L],
+			sum(ptdfZ[findfirst(L.==l),findfirst(Z.==z)]*NP[z] for z in Z)
+			)
+		# Fref0 = c.ext[:expressions][:Fref0] = @expression(c, [l=L],
+		# 	Fp0[l]-Fc0[l]
+		# 	)
 
 		# Objective
 		c.ext[:objective] = @objective(c, Min,
@@ -426,57 +437,19 @@ end
 
 ## Exporting to CSV
 write_to_CSV(m.ext[:sets][:L], m.ext[:sets][:L], "L.csv")
+write_to_CSV(m.ext[:sets][:N], m.ext[:sets][:N], "N.csv")
+write_to_CSV(m.ext[:sets][:Z], m.ext[:sets][:Z], "Z.csv")
+
 write_to_CSV(m.ext[:variables][:GEN], m.ext[:sets][:P], "GEN.csv")
 write_to_CSV(m.ext[:variables][:NP], m.ext[:sets][:Z], "NP.csv")
 write_to_CSV(m.ext[:expressions][:CG], m.ext[:sets][:Z], "CG.csv")
-write_to_CSV(m.ext[:expressions][:Fp], m.ext[:sets][:L], "Fp.csv")
+write_to_CSV(m.ext[:expressions][:Fp1], m.ext[:sets][:L], "Fp1.csv")
+write_to_CSV(m.ext[:expressions][:Fc1], m.ext[:sets][:L], "Fc1.csv")
+write_to_CSV(m.ext[:expressions][:Fref1], m.ext[:sets][:L], "Fref1.csv")
+write_to_CSV(m.ext[:expressions][:RAM], m.ext[:sets][:L], "RAM.csv")
 
 if congestion
 	write_to_CSV(c.ext[:variables][:UP], c.ext[:sets][:P], "UP.csv")
 	write_to_CSV(c.ext[:variables][:DOWN], c.ext[:sets][:P], "DOWN.csv")
 	write_to_CSV(c.ext[:expressions][:CC], c.ext[:sets][:Z], "CC.csv")
 end
-
-## Post-processing
-
-# print("\nGEN\n", value.(m.ext[:variables][:GEN]))
-# print("\nUP\n", value.(c.ext[:variables][:UP]))
-# print("\nDOWN\n", value.(c.ext[:variables][:DOWN]))
-# print("\nFp\n", value.(m.ext[:expressions][:Fp]))
-
-# nodes = DataFrame(
-# 	node = [n for n in m.ext[:sets][:N]],
-# 	D = [get_dem(c) for n in m.ext[:sets][:N]],
-# 	GMAX = [get_gen_up(p) for p in m.ext[:sets][:P]],
-# 	MC = [get_mc(p) for p in m.ext[:sets][:P]],
-# 	GEN = [value.(m.ext[:variables][:GEN][p]) for p in m.ext[:sets][:P]]
-# )
-#
-# CSV.write("C:/Users/User/Documents/Thesis/Modeling/results/nodes.csv", nodes,  delim=';', decimal=',')
-#
-# pretty_table(nodes, header=["node", "Dem[MW]", "Gmax[MW]","MC[€/MWh]","GEN[MW]"])
-#
-# lines = DataFrame(
-# 	line=["1-2","2-4","4-3","3-1"],
-# 	cap=[get_line_cap(l) for l in m.ext[:sets][:L]],
-# 	Fref=[value.(m.ext[:expressions][:Fref][l]) for l in m.ext[:sets][:L]],
-# 	Fc=[value.(m.ext[:expressions][:Fc][l]) for l in m.ext[:sets][:L]],
-# 	Fp=[value.(m.ext[:expressions][:Fp][l]) for l in m.ext[:sets][:L]],
-# 	RAMpos=[value.(m.ext[:expressions][:RAMpos][l]) for l in m.ext[:sets][:L]],
-# 	RAMneg=[value.(m.ext[:expressions][:RAMneg][l]) for l in m.ext[:sets][:L]]
-# )
-#
-# CSV.write("C:/Users/User/Documents/Thesis/Modeling/results/lines.csv", lines,  delim=';', decimal=',')
-#
-# pretty_table(lines, header=["line","cap[MW]","Fref[MW]","Fc[MW]","Fp[MW]","RAM+[MW]","RAM-[MW]"])
-#
-# zones = DataFrame(
-# 	zone=["A","B","C"],
-# 	NP=[value.(m.ext[:variables][:NP][z]) for z in m.ext[:sets][:Z]],
-# 	CG=[value.(m.ext[:expressions][:CG][z]) for z in m.ext[:sets][:Z]],
-# 	#CC=[value.(m.ext[:expressions][:CC][z]) for z in m.ext[:sets][:Z]]
-# )
-#
-# CSV.write("C:/Users/User/Documents/Thesis/Modeling/results/zones.csv", zones,  delim=';', decimal=',')
-#
-# #pretty_table(zones, header=["zone", "NP[MW]", "CG[EUR]", "CC[EUR]"])
